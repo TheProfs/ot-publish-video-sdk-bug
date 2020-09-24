@@ -1,0 +1,703 @@
+<link rel="import" href="/app/bower_components/polymer/polymer.html">
+<link rel="import" href="/app/bower_components/paper-spinner/paper-spinner.html">
+
+<link rel="import" href="ot-human-error.html">
+
+<script src="https://static.opentok.com/v2.17.7/js/opentok.min.js"></script>
+<script src="lib/DetectRTC.min.js"></script>
+<script src="classes/call-connection.js"></script>
+
+<!--
+`smooth-opentok`
+Opentok&#39;s API wrapped as a Polymer element for sane humans
+
+@demo demo/index.html
+-->
+
+<dom-module id="smooth-opentok">
+  <template>
+    <style is="custom-style">
+      paper-progress {
+        width: 100%;
+      }
+
+      ot-human-error {
+        position: relative;
+        color: #D50000;
+      }
+    </style>
+    <p>
+      <paper-progress indeterminate hidden$="[[!isStartingCall]]"></paper-progress>
+
+      <ot-human-error
+        last-error="{{lastError}}"
+        hidden$="[[!lastError]]">
+      </ot-human-error>
+    </p>
+  </template>
+
+  <script>
+    Polymer({
+
+      is: 'smooth-opentok',
+
+      properties: {
+        connections: {
+          type: Array,
+          value: function() {
+            return []
+          },
+          notify: true
+        },
+
+        session: {
+          type: Object,
+          notify: true
+        },
+
+        isStartingCall: {
+          type: Boolean,
+          value: false,
+          notify: true
+        },
+
+        lastError: {
+          type: Object,
+          value: function() {
+            return false
+          },
+          notify: true
+        },
+
+        isSessionConnected: {
+          type: Boolean,
+          value: false,
+          notify: true
+        },
+
+        isInCall: {
+          type: Boolean,
+          computed: '_isInCall(connections.*, isStartingCall)',
+          notify: true
+        },
+
+        noConnectionIsConnected: {
+          type: Boolean,
+          computed: '_noConnectionIsConnected(connections.*)',
+          notify: true
+        },
+
+        nobodyInCall: {
+          type: Boolean,
+          value: true,
+          computed: '_nobodyInCall(connections.*)',
+          notify: true
+        },
+
+        notInCallButOtherConnectionsInCall: {
+          type: Boolean,
+          value: false,
+          computed: '_notInCallButOtherConnectionsInCall(connections.*)',
+          notify: true
+        },
+
+        getRtcTokenUrl: {
+          type: String
+        },
+
+        webRtcCapability: {
+          type: Object,
+          value: function() {
+            return {
+              isWebRTCSupported: true
+            }
+          },
+          notify: true
+        },
+
+        screenSharingCapability: {
+          type: Object,
+          value: function() {
+            return {}
+          },
+          notify: true
+        },
+
+        screenshareBlockedDueToExtensionNotInstalled: {
+          type: Boolean,
+          value: false
+        },
+
+        extensionsInformation: {
+          type: Array,
+          value: function() {
+            return [
+              {
+                browser: 'chrome',
+                id: 'nfiighcfoehnhiapoaonedebnoigkieo',
+                version: 2
+              }
+            ]
+          },
+          observer: '_initScreensharing'
+        },
+
+        loggedInUser: {
+          observer: '_initOrReconnect'
+        },
+
+        creds: {
+          type: Object
+        },
+
+        isInitialised: {
+          type: Boolean,
+          value: false
+        }
+      },
+
+      attached: function() {
+        window.smoothOpentok = this
+
+        window.onmessage = e => {
+          if (e.data !== 'screenshare-ext-installed') return
+
+          this.fire('screenshare-ext-installed')
+
+          if (this.screenshareBlockedDueToExtensionNotInstalled) {
+            this._startScreenSharing()
+          }
+        }
+
+        this.set('webRtcCapability', Object.assign({}, DetectRTC, {
+          isWebRTCSupported: window.navigator.userAgent.match('CriOS') ?
+            false :
+            !!OT.checkSystemRequirements()
+        }))
+      },
+
+      init: async function() {
+        if (!this.isInitialised) {
+          this.set('isInitialised', true)
+          return this._initOrReconnect()
+        }
+      },
+
+      _initOrReconnect: async function() {
+        if (!this.isInitialised) return false
+
+        this.debounce('_initOrReconnect', () => {
+          if (this.session && this.session.isConnected()) {
+            this._reconnect()
+          } else {
+            this._init()
+          }
+        }, 1000)
+      },
+
+      _init: async function() {
+        try {
+          this.set('creds', await this._fetchCredentials(this.loggedInUser))
+          this.set('session', OT.initSession(
+            this.creds.api_key,
+            this.creds.session_id
+          ))
+
+          this.session.on('sessionReconnecting', e => {
+            this._handleError(
+              new Error(
+                'Internet connection lost. Attempting to reconnect...'
+              )
+            )
+          })
+
+          this.session.on('sessionReconnected', e => {
+            this._handleError(null)
+          })
+
+          this.session.on('sessionDisconnected', e => {
+            this.set('connections', [])
+            this._handleError(null)
+          })
+
+          this.session.on('connectionCreated', e => {
+            this._handleConnectionCreated(e.connection)
+          })
+
+          this.session.on('connectionDestroyed', e => {
+            this._handleConnectionDestroyed(e.connection)
+          })
+
+          this.session.on('streamCreated', e => {
+            this._handleStreamCreated(e.stream)
+          })
+
+          this.session.on('streamDestroyed', e => {
+            this._handleStreamDestroyed(e.stream)
+          })
+
+          this.session.on('streamPropertyChanged', e => {
+            this._handleStreamPropertyChanged(e)
+          })
+
+          this.session.on('signal', e => {
+            if (e.data && e.data.action === 'end-call') {
+              if (this._nobodyInCall()) return
+
+              this.stopCall()
+            }
+          })
+
+          await this._connectToSession(this.session, this.creds.token)
+
+          this.set('isSessionConnected', true)
+
+          this._handleSuccess()
+        } catch(err) {
+          this._handleError(err)
+        }
+      },
+
+      _reconnect: async function() {
+        console.log('_reconnect')
+
+        try {
+          this.set('isSessionConnected', false)
+          this.set('creds', await this._fetchCredentials(this.loggedInUser))
+          await this.session.disconnect()
+          await this._connectToSession(this.session, this.creds.token)
+
+          this.fire('reconnected')
+
+        } catch (err) {
+          throw err
+        } finally {
+          this.set('isSessionConnected', true)
+        }
+      },
+
+      _ensureSessionConnected: async function() {
+        if (this.session.isConnected())
+          return true
+
+        for (let i = 0; i < 10; i++) {
+          const isConnected = await new Promise(res => {
+            setTimeout(() => res(this.session.isConnected()), 1000)
+          })
+
+          if (isConnected) return true
+        }
+
+        throw new Error('Session failed to connect. Refreshing the page usually fixes this.')
+      },
+
+      _handleConnectionCreated: function(connection) {
+        this.push('connections', new CallConnection({
+          connection,
+          isMe: connection.id === this.session.connection.id,
+          toggleVideo: this.toggleVideo.bind(this),
+          toggleScreenShare: this.toggleScreenShare.bind(this)
+        }))
+      },
+
+      _handleConnectionDestroyed: function(connection) {
+        const i = this._findConnectionIndexById(connection.id)
+
+        this.splice('connections', i, 1)
+      },
+
+      _handleStreamCreated: function(stream, srcObject = undefined) {
+        const i = this._findConnectionIndexById(stream.connection.id)
+
+        const connection = this.connections[i]
+
+        this._ensureIPublishOnlyOneVideoStream(stream)
+
+        this.set(
+          `connections.${i}.streams.${stream.videoType}`,
+          Object.assign(stream, {
+            srcObject: srcObject
+          })
+        )
+
+        this.set(`connections.${i}.isConnected`,
+          connection.isMe
+          ? true
+          : connection.isConnected
+        )
+
+        if (this._isInCall()) {
+          this._subscribeToUnsubscribedStreams()
+        }
+
+        if (this._notInCallButOtherConnectionsInCall()) {
+          this.fire('connection-with-stream-added-but-i-am-not-in-call')
+        }
+
+        this.fire('connection-started-publishing', connection)
+      },
+
+      _handleStreamDestroyed: function(stream) {
+        const i = this._findConnectionIndexById(stream.connection.id)
+        const connection = this.connections[i]
+
+        this.set(`connections.${i}.streams.${stream.videoType}`, null)
+
+        const hasAtLeastOneStream = Object.values(connection.streams)
+          .some(stream => stream)
+
+        if (!hasAtLeastOneStream) {
+          this.set(`connections.${i}.isConnected`, false)
+        }
+      },
+
+      _handleStreamPropertyChanged: function({ stream, changedProperty, newValue }) {
+        const i = this._findConnectionIndexById(stream.connection.id)
+
+        this.set(
+          `connections.${i}.streams.${stream.videoType}.${changedProperty}`,
+          newValue
+        )
+      },
+
+      startCall: async function(opts) {
+        opts = opts || {}
+
+        this.set('isStartingCall', true)
+
+        try {
+          if (!opts.skipAvailableMinutesCheck) {
+            const hasAvailableCallMinutes = await this._hasAvailableCallMinutes()
+
+            if (!hasAvailableCallMinutes) {
+              this.fire('no-available-call-minutes')
+
+              return this._handleError(new Error('No available call minutes'))
+            }
+          }
+
+          await this._ensureSessionConnected()
+          await this._createPublisher('camera')
+          await this._subscribeToUnsubscribedStreams()
+          this.set('isStartingCall', false)
+          this._handleSuccess()
+        } catch(err) {
+          this._handleError(err)
+        } finally {
+          this.set('isStartingCall', false)
+        }
+      },
+
+      stopCall: function() {
+        this.connections.forEach((connection, i) => {
+          Object.values(connection.streams)
+            .filter(stream => stream)
+            .forEach(stream => {
+              if (stream.publisher) {
+                this.session.unpublish(stream.publisher)
+              } else if (stream.subscriber) {
+                this.session.unsubscribe(stream.subscriber)
+              } else {
+                // do nothing
+              }
+            })
+
+          this.set(`connections.${i}.isConnected`, false)
+        })
+      },
+
+      toggleScreenShare: async function(flag) {
+        if (!this.screenSharingCapability.supported) {
+          return asyncAlert.open({
+            warningText: 'Screen Sharing is not supported on this device.'
+          })
+        }
+
+        try {
+          if (this._isScreenSharing()) {
+            await this._stopScreenSharing()
+          } else {
+            await this._startScreenSharing()
+          }
+
+          this._handleSuccess()
+        } catch (err) {
+          this._handleError(err)
+        }
+      },
+
+      toggleVideo: function(flag) {
+        const me = this._findMyConnection()
+
+        if (!me) return false
+
+        me.streams.camera.publisher.publishVideo(flag)
+
+        if (me.streams.screen) {
+          this._stopScreenSharing()
+        }
+      },
+
+      _startScreenSharing: async function() {
+        const screenSharingCapability = await new Promise(resolve => {
+          OT.checkScreenSharingCapability(res => {
+            resolve(res)
+          })
+        })
+
+        if (!screenSharingCapability.supported) {
+          throw new Error('Screen-sharing not supported on this browser')
+        } else if (screenSharingCapability.extensionRequired &&
+            !screenSharingCapability.extensionInstalled) {
+          console.info('Requesting screen share extension installation...')
+          this.set('screenshareBlockedDueToExtensionNotInstalled', true)
+          return this.fire('request-screen-share-extension-installation')
+        }
+
+        this.set('screenshareBlockedDueToExtensionNotInstalled', false)
+
+        return this._createPublisher('screen')
+      },
+
+      _stopScreenSharing: function() {
+        const me = this._findMyConnection()
+
+        return me ? this.session.unpublish(me.streams.screen.publisher) : false
+      },
+
+      _subscribeToUnsubscribedStreams: function() {
+        const tasks = this.connections
+          .reduce((tasks, connection) => {
+            const task = Object.values(connection.streams)
+              .filter(stream => stream)
+              .filter(stream => !stream.publisher)
+              .filter(stream => !this.session.getSubscribersForStream(stream).length)
+              .map(stream => this._subscribeToStream(stream))
+
+            return tasks.concat(task)
+          }, [])
+
+        return Promise.all(tasks)
+      },
+
+      _subscribeToStream: function(stream) {
+        return new Promise((resolve, reject) => {
+          const subscriber = this.session.subscribe(stream, null, {
+            insertDefaultUI: false
+          }, err => {
+            if (err) {
+              this._handleError(err)
+              reject(err)
+
+              return
+            }
+          })
+
+          subscriber.on('videoDisabled', e => {
+            if (e.reason === 'quality') {
+              const i = this._findConnectionIndexById(e.target.stream.connection.id)
+              this.set(`connections.${i}.videoDisabledDueToQuality`, true)
+            }
+          })
+
+          subscriber.on('videoEnabled', e => {
+            if (e.reason === 'quality') {
+              const i = this._findConnectionIndexById(e.target.stream.connection.id)
+              this.set(`connections.${i}.videoDisabledDueToQuality`, false)
+            }
+          })
+
+          subscriber.once('videoElementCreated', e => {
+            /*
+             * @NOTE:
+             * - This check is here to unsubscribe to streams that
+             *   were pending subscription after the user has hanged up
+             *   the call.
+             *   There are reports of streams being subscribed to after
+             *   the publisher has hanged up.
+             */
+            if (!this.isInCall && !this.isStartingCall) {
+              this.session.unsubscribe(subscriber)
+
+              return resolve()
+            }
+
+            const subscribers = this.session.getSubscribersForStream(
+              subscriber.stream
+            )
+
+            const i = this._findConnectionIndexById(stream.connection.id)
+
+            this.set(
+              `connections.${i}.streams.${stream.videoType}.srcObject`,
+              e.element.srcObject
+            )
+            this.set(
+              `connections.${i}.streams.${stream.videoType}.subscriber`,
+              subscribers.length ? subscribers[0] : undefined
+            )
+            this.set(`connections.${i}.isConnected`, true)
+
+            this._handleSuccess()
+
+            resolve(stream)
+          })
+        })
+      },
+
+      _ensureIPublishOnlyOneVideoStream: function(stream) {
+        if (!stream.hasVideo) return
+
+        const i = this._findConnectionIndexById(stream.connection.id)
+
+        if (i === -1) return
+
+        Object.values(this.connections[i].streams)
+          .filter(s => s && s.publisher && s.id !== stream.id)
+          .forEach(s => s.publisher.publishVideo(false))
+      },
+
+      _createPublisher: async function(videoSource = 'camera') {
+        if (!this.session.isConnected())
+          await this._connectToSession(this.session, this.creds.token)
+
+        return new Promise((resolve, reject) => {
+          const publisher = OT.initPublisher(null, {
+            publishVideo: true,
+            insertDefaultUI: true
+          }, err => {
+            if (err) return reject(err)
+          })
+
+          publisher.on('streamDestroyed', e => {
+            this._handleStreamDestroyed(e.stream)
+          })
+
+          publisher.on('videoElementCreated', e => {
+            publisher.on('streamCreated', () => {
+              this._handleStreamCreated(e.target.stream, e.element.srcObject)
+              resolve()
+            })
+          })
+
+          this.session.publish(publisher, err => {
+            if (err) return reject(err)
+          })
+        })
+      },
+
+      _fetchCredentials: function(loggedInUser) {
+        return fetch(this.getRtcTokenUrl, {
+          method: 'POST',
+          body: JSON.stringify({
+            id_user: loggedInUser.id_user
+          }),
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8'
+          }
+        })
+        .then(res => {
+          if (!res.ok) throw new Error('Due to 3rd party platform issues, calls are currently unavailable. We are investigating this issue.')
+
+          return res.json()
+        })
+      },
+
+      _connectToSession(session, token) {
+        return new Promise((resolve, reject) => {
+          session.connect(token, err => {
+            if (err) return reject(err)
+
+            resolve()
+          })
+        })
+      },
+
+      _initScreensharing: function(extensionsInformation) {
+        this._registerScreenSharingExtensions(extensionsInformation)
+        OT.checkScreenSharingCapability(res => {
+          this.set('screenSharingCapability', res)
+        })
+      },
+
+      _registerScreenSharingExtensions: function(extensionsInformation) {
+        extensionsInformation.forEach(info => {
+          OT.registerScreenSharingExtension(info.browser, info.id, info.version)
+        })
+      },
+
+      _findMyConnection: function() {
+        return this.connections.find(c => c.isMe)
+      },
+
+      _isInCall: function() {
+        const me = this._findMyConnection()
+
+        return (me ? me.isConnected : false) && !this.isStartingCall
+      },
+
+      _isScreenSharing: function() {
+        const me = this._findMyConnection()
+
+        return me ? !!me.streams.screen : false
+      },
+
+      _findConnectionIndexById: function(connectionId) {
+        return this.connections.findIndex(c => c.id === connectionId)
+      },
+
+      _noConnectionIsConnected: function() {
+        return this.connections.every(c => !c.isConnected)
+      },
+
+      _nobodyInCall: function() {
+        const nobodyHasStreams = this.connections.every(other =>
+          Object.values(other.streams).every(stream => !stream)
+        )
+
+        return nobodyHasStreams
+      },
+
+      _notInCallButOtherConnectionsInCall: function() {
+        const me = this.connections.find(c => c.isMe)
+        const others = this.connections.filter(c => !c.isMe)
+        const othersHaveStreams = others.some(other =>
+          Object.values(other.streams).some(stream => stream)
+        )
+
+        return me && !me.isConnected && othersHaveStreams
+      },
+
+      _hasAvailableCallMinutes: function() {
+        return this.notInCallButOtherConnectionsInCall || fetch(this.loginUrl, {
+          method: 'POST',
+          headers: Object.assign(this.authHeaders, {
+            'Content-Type': 'application/json; charset=utf-8'
+          })
+        })
+        .then(res => {
+          if (!res.ok)
+            throw new Error(
+              'An error occured while calculating your remaining minutes'
+            )
+
+          return res.json()
+        })
+        .then(res => res.is_unlimited || (res.available_minutes && res.available_minutes > 0))
+      },
+
+      _handleSuccess: function() {
+        this.set('lastError', false)
+      },
+
+      _handleError: function(err) {
+        this.set('lastError', err)
+
+        if (err) {
+          this.fire('error', err)
+          console.error(err)
+        }
+      }
+    });
+  </script>
+</dom-module>
