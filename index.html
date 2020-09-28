@@ -5,6 +5,16 @@
   </head>
   <body>
     <div id="videos"></div>
+    <video
+      id="video"
+      muted="true"
+      onloadedmetadata="this.muted = true"
+      autoplay="true"
+      playsinline="true"
+      ondragstart="event.preventDefault();"
+      draggable="true">
+      Sorry, Web RTC is not available in your browser
+    </video>
   </body>
 </html>
 
@@ -66,7 +76,7 @@
     }, handleError)
 
     publisher.addEventListener('videoElementCreated', e => {
-      document.querySelector('#videos').appendChild(e.element)
+      document.querySelector('#video').srcObject = e.element.srcObject
     })
 
     // Connect to the session
